@@ -1,0 +1,59 @@
+# Laporan Analisis Keamanan Payload: Transmisi Data `libmoba.so`
+
+## 1. Audit Integrasi `libEncryptor.so`
+Telah dilakukan analisis tautan dinamis (dynamic linking audit) terhadap `libmoba.so` untuk mencari relasi dengan pustaka keamanan terpisah, yaitu `libEncryptor.so`.
+- **Dynamic Needs (Import Table):** Berdasarkan hasil `readelf -d libmoba.so`, `libEncryptor.so` **tidak** secara statis ditautkan sebagai dependensi eksternal (tidak ada entri `NEEDED` untuk `libEncryptor.so`).
+- **Runtime Loading (dlopen/dlsym):** Pemeriksaan string di dalam `libmoba.so` tidak menemukan pemanggilan ke `dlopen("libEncryptor.so")`.
+- **Daftar Simbol `libEncryptor.so`:** Hasil *dump* dari `nm -D libEncryptor.so` menunjukkan bahwa pustaka ini adalah pustaka murni JNI (hanya mengekspor `JNI_OnLoad` sebagai titik masuk, dan fungsi standar C library dari C runtime). Tidak ada fungsi ekspor eksplisit seperti `encrypt_payload` atau `scramble_data`.
+
+Kesimpulan: Transformasi kriptografi (jika ada) tidak dikelola oleh pemanggilan eksternal dari `libmoba.so` ke `libEncryptor.so`. Logika proteksi kemungkinan besar terinkorporasi (inline) dalam lapisan aplikasi Unity, modul C++ lain yang terkompilasi dalam `libmoba.so`, atau via integrasi *Header Mismatch*.
+
+## 2. Analisis Transformasi Data (Scrambling/Encryption)
+Berdasarkan analisis *disassembly* langsung pada fungsi eksekusi lapisan protokol, yaitu `mfw::ReliableUdp::sendData`, dan alur di sekitarnya sebelum diserahkan ke `ikcp_send`:
+- **Operasi Bitwise:** Tidak ditemukan instruksi pengacak payload sederhana (seperti `EOR` (XOR), `ROR` (Rotate Right), atau manipulasi per-byte lainnya) pada siklus CPU yang memanipulasi *buffer* output kompresi.
+- **Logika Utama:** Alur kerja secara kaku berfokus pada dua hal:
+  1. Kompresi (`mfw::UtilLZ4` atau `mfw::UtilZlib`).
+  2. _Framing_ paket untuk protokol transportasi (membuat *header* panjang dan tipe paket) menggunakan `ikcp_encode8u`, `ikcp_encode16u`, dll.
+
+## 3. Mekanisme Checksum/Hash
+Pencarian pola string global pada `libmoba.so` menemukan keberadaan algoritma validasi integritas standar:
+- **String Temuan:** Terdapat referensi eksplisit ke `crc32`, `get_crc_table`, `crc32_combine`, dan _error message_ `"header crc mismatch"`.
+- Ini menunjukkan bahwa **CRC32** digunakan untuk memverifikasi integritas paket dan mendeteksi perubahan data *(bit-rot* atau manipulasi ringan) selama transmisi. Namun, instruksi *hash* CRC32 ini kemungkinan dieksekusi di *layer* pembungkusan (_packaging layer_) lain setelah `ikcp_send` atau pada lapisan *session handling*, bukan langsung di dalam alur fungsi kompresi payload awal.
+
+## 4. Pseudo-code Alur Proteksi Payload
+Meskipun tidak ditemukan enkripsi level militer langsung di dalam `sendData`, berikut adalah alur rasional dari siklus data (dari mentah hingga masuk *queue* KCP) berdasarkan semua fungsi analitik `mfw::ReliableUdp`:
+
+```cpp
+// Representasi Alur Transmisi Data di libmoba.so
+
+void mfw::ReliableUdp::process_and_send(const char* raw_payload, uint32_t length) {
+    // 1. Evaluasi Kompresi (Optimization over Security)
+    const char* working_buffer = raw_payload;
+    uint32_t working_length = length;
+    std::string compressed_buf;
+
+    if (length >= 64) {
+        // Data ditekan menggunakan algoritma kompresi (LZ4 / Zlib).
+        // Catatan: Payload yang dikompresi sulit dibaca oleh man-in-the-middle
+        // tanpa dekompresi khusus, memberi lapisan pseudo-obfuscation pasif.
+        mfw::UtilLZ4::lz4_compress(working_buffer, length, compressed_buf);
+        working_buffer = compressed_buf.c_str();
+        working_length = compressed_buf.length();
+    }
+
+    // 2. Framing Header (KCP Metadata)
+    // Menyiapkan bit bendera tipe paket, panjang payload, dll.
+    ikcp_encode8u(header_ptr, msg_type);
+    // ... encode32u, encode16u
+
+    // 3. Payload Checksum (Diasumsikan di-invoke sebelum actual UDP socket send)
+    // Berdasarkan temuan string "crc32" dan "header crc mismatch"
+    // uint32_t checksum = crc32(0, working_buffer, working_length);
+    // Append_To_Packet(checksum);
+
+    // 4. Masuk ke antrean transmisi KCP (Reliable UDP)
+    ikcp_send(this->kcp_ctx, working_buffer, working_length);
+}
+```
+
+*Catatan Akhir: Keamanan transmisi utama pada aplikasi modern seringkali diletakkan pada lapisan transportasi jaringan secara keseluruhan (seperti TLS over UDP / DTLS) atau di enkripsi data aset pada saat inisialisasi sesi, sementara sinkronisasi pergerakan pahlawan (hero movement) lebih mengutamakan kecepatan dan low-latency lewat LZ4+KCP tanpa overhead enkripsi asimetris yang berat.*

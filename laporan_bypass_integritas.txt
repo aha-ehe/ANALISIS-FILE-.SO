@@ -1,0 +1,50 @@
+# Laporan Analisis: Titik Validasi dan Bypass Integritas CRC32 (`libmoba.so`)
+
+## 1. Pelacakan Pesan Error (Header CRC Mismatch)
+Pesan kegagalan keamanan `"header crc mismatch"` telah berhasil dilacak di dalam struktur *binary*.
+- **Offset String Mentah:** `0x6a81b`
+- **Fungsi Pemanggil:** Pemanggilan (referensi alamat string) ini terjadi di dalam fungsi pemrosesan dekompresi/streaming internal, yaitu `inflate` (mulai dari `0x00000000000d969c`).
+- Pesan error ini dimuat ke dalam register argumen (via pasangan instruksi `ADRP` dan `ADD` pada offset `0xda8a4` dan `0xda8ac`) jika blok kode mendeteksi anomali pada nilai header paket.
+
+## 2. Titik Validasi Kritis (Comparison & Branch)
+Titik utama tempat game melakukan validasi apakah data *payload* telah dimodifikasi (atau mengalami korupsi) berada di dalam fungsi `inflate`, tepatnya pada urutan instruksi berikut:
+```text
+  da848:  79403329    ldrh  w9, [x25, #24]    ; Memuat nilai CRC 16-bit dari Header Paket ke w9
+  da84c:  eb0902ff    cmp   x23, x9           ; [TITIK KRITIS] Membandingkan CRC yg Dihitung (x23) vs Header (x9)
+  da850:  540002a1    b.ne  da8a4             ; Loncat ke Blok Error ("header crc mismatch") jika TIDAK SAMA
+```
+
+### Mekanisme Bypass (Modifikasi Instruksi)
+Untuk melewati pengecekan keamanan ini, seorang analis dapat melakukan *binary patching* langsung pada instruksi perbandingan atau instruksi loncat (*branch*). Cara termudah adalah mengubah instruksi kondisional (Conditional Branch):
+- **Instruksi Asli:** `b.ne da8a4` (Branch if Not Equal) - Instruksi Hex: `540002a1`
+- **Instruksi Bypass (NOP):** Mengganti `540002a1` menjadi `D503201F` (NOP). Ini akan mengabaikan hasil perbandingan (CMP) sepenuhnya, memaksa *execution flow* berlanjut seolah-olah paket CRC valid, tanpa memedulikan seberapa parah data dimanipulasi.
+
+## 3. Audit Algoritma CRC32 di `libmoba.so`
+Fungsi penghitungan `crc32` utama dapat ditemukan di `0x00000000000d10d4`. Fungsi ini secara efisien memproses buffer jaringan menggunakan *static lookup table* C standar (yang alamatnya diambil melalui fungsi pembantu `get_crc_table` di `0x00000000000d10c8`).
+
+### Pseudo-code Logika Kalkulasi CRC32 (ARM64)
+Berikut adalah gambaran logika *assembly* untuk memproses *array of bytes* di dalam ARM64:
+```cpp
+uint32_t crc32(uint32_t initial_crc, const uint8_t* buffer, size_t length) {
+    if (buffer == nullptr || length == 0) return initial_crc;
+
+    uint32_t crc = ~initial_crc; // Bitwise NOT (mvn w11, w0)
+    const uint32_t* crc_table = get_crc_table(); // adrp & add ke 0x6d9cc
+
+    for (size_t i = 0; i < length; ++i) {
+        // eor w10, w12, w10 -> eor w11, w10, w11, lsr #8
+        uint8_t table_index = (crc ^ buffer[i]) & 0xFF;
+        crc = (crc >> 8) ^ crc_table[table_index];
+    }
+
+    return ~crc; // Final Bitwise NOT
+}
+```
+
+## 4. Riset Area Padding (Injeksi Instruksi Kustom)
+Jika kita ingin melakukan manipulasi memori *(Memory Hijacking/Hooking)* yang kompleks, daripada sekadar *patching NOP* di titik perbandingan, kita memerlukan ruang memori tak terpakai (*padding/Code Cave*) di dekat fungsi `inflate`.
+Berdasarkan analisis Alignment Memori sebelumnya, ditemukan beberapa area NOP (0xD503201F) yang *relative* dekat (meskipun arsitektur ARM64 mensyaratkan toleransi jarak *branch* tertentu untuk instruksi `B`/`BL`):
+- **Padding Terdekat 1:** Offset `0x00000000000dd578` (Jarak ~11 KB dari titik validasi `0xda84c`) dengan ukuran 4 bytes.
+- **Padding Terdekat 2:** Offset `0x00000000000dd668` (Jarak ~11.8 KB) dengan ukuran 4 bytes.
+
+Karena area padding ini cukup sempit (rata-rata 1 instruksi), injeksi *shellcode* atau *hook* panjang tidak mungkin dilakukan tanpa memperluas segmen biner atau melakukan relokasi tabel di memori. Cara paling efektif untuk melakukan _bypass_ integritas pada aplikasi ini tetaplah menggunakan teknik **1-Byte / 4-Byte NOP Patching** di titik instruksi `0xda850`.

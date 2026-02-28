@@ -1,0 +1,38 @@
+# Global Security Map: Project Chimera (Inter-dependency & Library Audit)
+
+Laporan ini menyajikan gambaran keterkaitan tingkat tinggi (inter-dependency) dan peta keamanan fungsional dari berbagai pustaka (*libraries*) yang beroperasi di sekitar *core engine* aplikasi, serta area potensial untuk *Redundant Shellcode*.
+
+## 1. Peta Ketergantungan (Inter-dependency Mapping)
+Berdasarkan analisis tabel impor dinamis (Dynamic `NEEDED`), tidak ada hubungan *hard-linked* langsung di antara pustaka pendukung ini (misal: `libunity.so` tidak memiliki `NEEDED libsigner.so`).
+Sebaliknya, semua pustaka ini bertumpu pada antarmuka sistem operasi Android (`libc.so`, `libm.so`, `libdl.so`, `liblog.so`).
+**Arsitektur Runtime:** Hal ini mengindikasikan arsitektur pemuatan modular. Aplikasi Java (APK) atau *framework* Unity memuat masing-masing *shared object* ini menggunakan `System.loadLibrary()` atau `dlopen()`. Koordinasi fungsi di antara mereka difasilitasi oleh JNI (*Java Native Interface*) di *layer* Java, bukan melalui komunikasi *Native-to-Native* statis.
+
+## 2. Audit Fungsionalitas Library Utama
+
+### A. `libsigner.so` (Integrity Check)
+- **Titik Pemuatan & Entry:** Mengekspor dua fungsi JNI eksplisit, yaitu `Java_com_adjust_sdk_sig_NativeLibHelper_nOnResume` dan `Java_com_adjust_sdk_sig_NativeLibHelper_nSign`.
+- **Fungsi Utama:** Ini bukanlah pusat komando validasi file/APK secara mandiri, melainkan modul kriptografi spesifik (Signature Generator) yang terkait dengan **Adjust SDK** (Analytics/Attribution tracker).
+- **Anti-Debugging/Deteksi:** Mengimpor fungsi pembantu standar Linux yang dapat digunakan untuk membaca metadata OS atau *anti-hooking* ringan (seperti `getauxval` untuk cek kapabilitas CPU, `syscall`, dan `readdir` / `readlink` yang biasanya digunakan untuk mengecek `/proc/self/maps` dari *injector* yang mencurigakan).
+
+### B. `libshadowhook.so` (Self-Hooking & Monitoring)
+- **Pola String & Ekspor:** Mengandung string seperti `shadowhook_dlopen` dan menangkap *failed* logging (`Monitor dlopen failed`, `linker: dlopen nothing.so FAILED`).
+- **Fungsi Utama:** Library ini merupakan kerangka kerja **Inline/PLT Hooking** (berbasis proyek open-source *ShadowHook* dari ByteDance).
+- **Deteksi Manipulasi:** Karena memonitor (`hook`) pemanggilan `dlopen` dan `mmap`, library ini bertindak sebagai penjaga gerbang tingkat lanjut. Ia dapat mendeteksi, mencegat, atau mengarahkan ulang proses *loading* pustaka lain yang mencoba masuk ke dalam ruang memori aplikasi.
+
+### C. `libil2cpp.so` (Stub / Loader Analysis)
+- **Ukuran File:** Hanya sekitar 384 KB (sangat kecil untuk *runtime* IL2CPP penuh yang biasanya berukuran puluhan MB).
+- **Indikasi Stub:** Ditemukan *strings* berbunyi `"LoadFakeLibIL2CPP"`, `"Load so..."`, `"CopySOToAppLib"`, dan `"GetPersistentAssetsDataPath failed!"`.
+- **Fungsi Utama:** Ini murni sebuah **Loader / Facade**. Untuk menghindari *static reverse-engineering* yang mudah, *loader* ini mengekstrak dan mendekripsi IL2CPP *runtime* sesungguhnya (berisi logika game C#) dari direktori aset (`assets/`) atau data persisten (`/data/data/`) secara dinamis saat *runtime*, menyalinnya ke *app lib*, dan memuatnya ke dalam memori.
+
+## 3. Global Code Cave Mapping (Kandidat Redundant Shellcode)
+Untuk keperluan injeksi tingkat lanjut (*Redundant Shellcode* / menempatkan *hook* cadangan), pencarian area *padding* (*null bytes* atau *NOPs*) yang terisolasi di dalam *executable section* (`.text`) dilakukan pada `libsigner.so` dan `libunity.so`.
+
+**Hasil Analisis Kompilasi (Kerapatan Kode):**
+- Kedua pustaka tersebut dikompilasi dengan optimasi tinggi. Tidak ditemukan *code caves* kosong (*padding* NOP berurutan) yang berukuran 16 bytes atau lebih (yang diperlukan untuk *shellcode/trampoline* ukuran standar).
+- **`libsigner.so`**: Mayoritas hanya memiliki 1 baris instruksi *padding* (4 bytes), contohnya di offset `0x7b44` dan `0x7b7c`.
+- **`libunity.so`**: Memiliki beberapa *padding block* yang sedikit lebih besar (antara 4 hingga 12 bytes), contohnya di offset `0x488128` (8 bytes) dan `0x488684` (12 bytes).
+
+**Kesimpulan Injeksi:** Injeksi logika baru ke dalam `.text` pada library-library ini tidak layak dilakukan via *Code Cave / NOP Padding* statis. Jika diperlukan *Redundant Shellcode*, injeksi harus dilakukan dengan:
+1. Mengeksploitasi seksi `.eh_frame` (Exception Handling Frame) yang kurang diawasi.
+2. Memperbesar ukuran segment (*Section Extension*).
+3. Mengeksploitasi fungsi yang sudah mati/tidak dipanggil *(Dead Code Replacement)*.

@@ -1,0 +1,30 @@
+# Laporan Analisis: Logika Pengiriman Data KCP (`ikcp_send`)
+
+Dokumen ini merangkum analisis statis dari *disassembly* fungsi `ikcp_send` (offset `0x000ceb0c`) pada *library* `libmoba.so`. Fokus utama adalah skalabilitas pengiriman, penanganan fragmentasi paket, serta manajemen *queue* sebelum transmisi fisik.
+
+## 1. Analisis Skalabilitas Fragmentasi (Burst Capacity)
+Fungsi `ikcp_send` bertugas memecah payload tingkat aplikasi (*user-level*) menjadi ukuran yang sesuai dengan jaringan sebelum ditambahkan ke antrean transmisi.
+- **Pengambilan MSS:** Pada awal fungsi (contoh di offset `ceb5c`), sistem memuat batas `mss` dari *control block* (`ldr w9, [x21, #8]`).
+- **Kalkulasi Fragmen:** Sistem membagi total panjang data payload dengan `mss` untuk menentukan berapa banyak segmen KCP (fragmen) yang dibutuhkan (`udiv w8, w9, w26` pada `cec5c`).
+- **Limitasi Kritis (Burst Limit):** Pada offset `cec60`, terdapat instruksi `cmp w8, #0xff`. Ini menunjukkan bahwa **batas maksimal fragmentasi dalam satu pemanggilan `ikcp_send` adalah 255 segmen**.
+Jika `payload_size / mss > 255`, fungsi akan langsung kembali (return) dengan *error code* `-2` (direpresentasikan oleh instruksi `mov w0, #0xfffffffe` pada `cec68`).
+**Dampak:** Dalam kondisi *high-load*, klien tidak bisa mengirim data mentah sekaligus lebih dari `255 * mss` bytes (sekitar ~350 KB). Jika aplikasi mencoba mengirim lebih besar dari itu, *message* akan gagal masuk *queue*.
+
+## 2. Manajemen Antrean (`snd_queue`) & Alokasi Memori
+Jika ukuran mematuhi aturan 255 fragmen, fungsi memasuki *looping* untuk mengalokasikan dan menyisipkan memori:
+- **Alokasi Segmen:** Untuk setiap pecahan fragmen, `ikcp_send` mengalokasikan memori dinamis *(node)* untuk menyimpan struktur segmen dan sebagian payload. Hal ini dilakukan melalui pemanggilan `malloc` (misalnya pada `ceba4` atau `cecbc`) atau menggunakan fungsi alokator khusus.
+- **Penyalinan Data:** Data dari *buffer* aplikasi kemudian disalin ke dalam alokasi baru tersebut menggunakan pemanggilan blok memori standar (`bl 1b77f0 <memcpy@plt>`).
+- **Penyisipan ke Antrean (Tail Append):** Setiap segmen yang baru dibuat dihubungkan ke dalam daftar tertaut berganda (*doubly linked list*) yang bertindak sebagai `snd_queue`. Pointer ekor (*tail pointer*) dari *queue* ini terus-menerus diperbarui dan disimpan pada offset memori `[x21, #144]`.
+
+## 3. Evaluasi Congestion Control (Saturasi)
+Sebuah temuan yang sangat penting untuk stabilitas terdistribusi:
+- Fungsi `ikcp_send` **TIDAK** memvalidasi kapasitas *Send Window* (`snd_wnd` di offset `+56`).
+- **Implikasi:** Fungsi `ikcp_send` akan selalu menyerap (menelan) data ke dalam *local queue* (menggunakan RAM) sebanyak apapun yang aplikasi minta (selama setiap permintaannya < 255 fragmen), tanpa peduli apakah jaringan sedang *lag* atau antrean transmisi sudah jenuh.
+- Sistem bergantung sepenuhnya pada manajemen memori *queue* secara lokal *(Throttling tertunda)*. Kepadatan *queue* ini baru dievaluasi oleh *Congestion Control* di dalam fungsi pemrosesan aktual (yang terjadi kemudian).
+
+## 4. Hubungan dengan `ikcp_flush` (Trigger Transmisi)
+Dari hasil *disassembly*, di dalam `ikcp_send` **tidak ditemukan** satupun pemanggilan eksplisit (`bl` atau `b`) menuju fungsi `ikcp_flush` (fungsi yang mengirim UDP sesungguhnya).
+- **Arsitektur Pemrosesan (Polling Model):** `ikcp_send` murni hanya memindahkan data dari buffer aplikasi ke dalam *memory list* (sebagai *producer*).
+- Pengiriman data ke soket jaringan (*consumer*) terjadi secara asinkron (lepas). Subsistem *network loop* (kemungkinan diatur oleh mesin Unity atau thread terpisah di `mfw::ReliableUdp`) akan memanggil fungsi `ikcp_update` secara periodik, dan `ikcp_update` itulah yang kemudian akan memanggil `ikcp_flush`.
+
+Model ini dirancang agar operasi *input controller* (joystick) di layer aplikasi *(Game Loop)* tidak terblokir *(non-blocking)* oleh operasi I/O jaringan yang melambat. Namun pada saat *traffic* puncak, penumpukan data di RAM tanpa henti (karena *send window* tidak dicek di layer pertama) bisa memicu *Out-Of-Memory* (OOM) atau *desynchronization delay* ketika data akhirnya diluncurkan secara massal.

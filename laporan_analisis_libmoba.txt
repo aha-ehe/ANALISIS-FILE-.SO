@@ -1,0 +1,249 @@
+# Laporan Analisis Teknis Mendalam: `libmoba.so`
+
+## 1. ELF Header & Program Metadata
+
+### Deskripsi Arsitektur dan Endianness
+Berdasarkan analisis ELF Header (`readelf -h`), berikut adalah metadata utama dari `libmoba.so`:
+- **Class:** ELF64 (64-bit)
+- **Data (Endianness):** 2's complement, little endian
+- **OS/ABI:** UNIX - System V
+- **Machine (Arsitektur):** AArch64 (ARM64)
+- **Type:** DYN (Shared object file)
+- **Entry Point Address:** 0x0
+
+### Analisis Program Header Table (Segmentasi Memori)
+Analisis Program Header (`readelf -l`) menunjukkan bagaimana file biner ini dipetakan ke dalam memori saat eksekusi. Terdapat 9 segment utama:
+- **LOAD (R E):** Memiliki flag `R E` (Read-Execute). Ini adalah area eksekusi utama yang memuat section `.text`, `.rodata`, `.plt`, dan instruksi lain yang dapat dieksekusi. Offset VAddr berada di `0x0000000000000000` dengan ukuran memori `0x00000000001bbbd0`.
+- **LOAD (RW):** Terdapat dua segmen `LOAD` dengan flag `RW` (Read-Write). Ini adalah area data, memuat `.data`, `.bss`, `.dynamic`, `.got`, `.got.plt`, dll.
+- **GNU_RELRO (R):** Segmen Read-Only Relocation untuk mitigasi eksploitasi keamanan, mencegah modifikasi pada `.got` (sebagian), `.dynamic`, dll.
+- **GNU_STACK (RW):** Segmen ini menunjukkan bahwa stack untuk thread eksekusi ditandai sebagai `RW` (Read-Write) tanpa izin Execute (`E`), sebuah fitur keamanan standar (NX bit/DEP) pada sistem modern.
+
+## 2. Section & Segment Mapping
+
+### Pemetaan Alamat Section Utama
+Berikut adalah ringkasan pemetaan alamat virtual (VAddr), ukuran (Size), dan atribut untuk section utama yang relevan:
+
+| Section Name | Tipe | VAddr (Hex) | Offset (Hex) | Ukuran (Hex) | Atribut | Deskripsi |
+| :--- | :--- | :--- | :--- | :--- | :--- | :--- |
+| `.rodata` | PROGBITS | `0000000000065f90` | `00065f90` | `0000000000011044` | AMS (Alloc, Merge, Strings) | Read-only data. |
+| `.text` | PROGBITS | `00000000000a76e0` | `000a76e0` | `000000000010ff90` | AX (Alloc, Execute) | Area instruksi kode utama yang dapat dieksekusi. |
+| `.plt` | PROGBITS | `00000000001b7670` | `001b7670` | `0000000000004560` | AX (Alloc, Execute) | Procedure Linkage Table (digunakan dalam dynamic linking). |
+| `.dynamic` | DYNAMIC | `00000000001c8380` | `001c4380` | `00000000000001e0` | WA (Write, Alloc) | Informasi dynamic linking. |
+| `.data` | PROGBITS | `00000000001cf070` | `001c7070` | `0000000000000a48` | WA (Write, Alloc) | Data inisialisasi yang dapat dimodifikasi. |
+| `.bss` | NOBITS | `00000000001cfac0` | `001c7ab8` | `00000000000047e1` | WA (Write, Alloc) | Data yang tidak diinisialisasi. |
+
+### Identifikasi Segment R-E (Read-Execute)
+Berdasarkan analisis *Program Header*, segment dengan atribut **R-E** (Read-Execute) berada di:
+- **Alamat Mulai (VAddr):** `0x0000000000000000`
+- **Ukuran (MemSiz):** `0x00000000001bbbd0` (1.77 MB)
+
+Segment ini menaungi section instruksi seperti `.text` (dimulai di `0x00000000000a76e0`) dan `.plt` (dimulai di `0x00000000001b7670`).
+
+### Output Mentah: Section Headers
+Output lengkap dari pemetaan section disertakan di bawah ini untuk perhitungan presisi:
+
+```text
+There are 27 section headers, starting at offset 0x1c7c70:
+
+Section Headers:
+  [Nr] Name              Type             Address           Offset
+       Size              EntSize          Flags  Link  Info  Align
+  [ 0]                   NULL             0000000000000000  00000000
+       0000000000000000  0000000000000000           0     0     0
+  [ 1] .note.androi[...] NOTE             0000000000000238  00000238
+       0000000000000098  0000000000000000   A       0     0     4
+  [ 2] .note.gnu.bu[...] NOTE             00000000000002d0  000002d0
+       0000000000000024  0000000000000000   A       0     0     4
+  [ 3] .dynsym           DYNSYM           00000000000002f8  000002f8
+       0000000000014d78  0000000000000018   A       8     1     8
+  [ 4] .gnu.version      VERSYM           0000000000015070  00015070
+       0000000000001bca  0000000000000002   A       3     0     2
+  [ 5] .gnu.version_r    VERNEED          0000000000016c3c  00016c3c
+       0000000000000060  0000000000000000   A       8     3     4
+  [ 6] .gnu.hash         GNU_HASH         0000000000016ca0  00016ca0
+       0000000000006050  0000000000000000   A       3     0     8
+  [ 7] .hash             HASH             000000000001ccf0  0001ccf0
+       0000000000006f30  0000000000000004   A       3     0     4
+  [ 8] .dynstr           STRTAB           0000000000023c20  00023c20
+       0000000000023529  0000000000000000   A       0     0     1
+  [ 9] .rela.dyn         RELA             0000000000047150  00047150
+       0000000000018660  0000000000000018   A       3     0     8
+  [10] .rela.plt         RELA             000000000005f7b0  0005f7b0
+       00000000000067e0  0000000000000018  AI       3    22     8
+  [11] .rodata           PROGBITS         0000000000065f90  00065f90
+       0000000000011044  0000000000000000 AMS       0     0     16
+  [12] .gcc_except_table PROGBITS         0000000000076fd4  00076fd4
+       0000000000009674  0000000000000000   A       0     0     4
+  [13] .eh_frame_hdr     PROGBITS         0000000000080648  00080648
+       0000000000007354  0000000000000000   A       0     0     4
+  [14] .eh_frame         PROGBITS         00000000000879a0  000879a0
+       000000000001fd3c  0000000000000000   A       0     0     8
+  [15] .text             PROGBITS         00000000000a76e0  000a76e0
+       000000000010ff90  0000000000000000  AX       0     0     16
+  [16] .plt              PROGBITS         00000000001b7670  001b7670
+       0000000000004560  0000000000000000  AX       0     0     16
+  [17] .data.rel.ro      PROGBITS         00000000001bfbd0  001bbbd0
+       0000000000008768  0000000000000000  WA       0     0     8
+  [18] .fini_array       FINI_ARRAY       00000000001c8338  001c4338
+       0000000000000010  0000000000000000  WA       0     0     8
+  [19] .init_array       INIT_ARRAY       00000000001c8348  001c4348
+       0000000000000038  0000000000000000  WA       0     0     8
+  [20] .dynamic          DYNAMIC          00000000001c8380  001c4380
+       00000000000001e0  0000000000000010  WA       8     0     8
+  [21] .got              PROGBITS         00000000001c8560  001c4560
+       0000000000000858  0000000000000000  WA       0     0     8
+  [22] .got.plt          PROGBITS         00000000001c8db8  001c4db8
+       00000000000022b8  0000000000000000  WA       0     0     8
+  [23] .data             PROGBITS         00000000001cf070  001c7070
+       0000000000000a48  0000000000000000  WA       0     0     16
+  [24] .bss              NOBITS           00000000001cfac0  001c7ab8
+       00000000000047e1  0000000000000000  WA       0     0     32
+  [25] .comment          PROGBITS         0000000000000000  001c7ab8
+       00000000000000b2  0000000000000001  MS       0     0     1
+  [26] .shstrtab         STRTAB           0000000000000000  001c7b6a
+       0000000000000104  0000000000000000           0     0     1
+Key to Flags:
+  W (write), A (alloc), X (execute), M (merge), S (strings), I (info),
+  L (link order), O (extra OS processing required), G (group), T (TLS),
+  C (compressed), x (unknown), o (OS specific), E (exclude),
+  D (mbind), p (processor specific)
+```
+
+## 3. Symbol Table & Dependency Audit
+
+### Dependency Audit (Import Table)
+Berdasarkan `readelf -d libmoba.so` (Dynamic section), library ini memiliki dependensi (NEEDED) terhadap pustaka sistem standar Android berikut:
+- `libandroid.so`
+- `liblog.so`
+- `libc.so`
+- `libm.so`
+- `libdl.so`
+
+### Daftar Exported Symbols Prioritas
+Berdasarkan analisis tabel simbol (`nm -D libmoba.so`), berikut adalah daftar fungsi JNI (Entry Point) dan fungsi inti dari namespace `mfw` (Manajemen Sesi / Sinkronisasi) yang diekspor:
+
+#### JNI Functions (Java to Native Entry Points)
+Fungsi-fungsi ini merupakan jembatan antara aplikasi Java (Android) dan logika C/C++ pada game Unity:
+1. `Java_com_moba_unityplugin_NativeUtility_invokeFunctionPointerLongLong` (0x00000000000fd6e8)
+2. `Java_com_moba_unityplugin_NativeUtility_invokeFunctionSetAssetManager` (0x00000000000fd6f4)
+3. `Java_com_moba_unityplugin_UnityConfig_nativeSupportMoveLogic` (0x00000000000a7c84)
+
+#### Modul Manajemen Sesi & Sinkronisasi (`mfw` namespace)
+Terdapat banyak fungsi di bawah namespace `mfw::ReliableUdp` dan operasi `Battle` yang menunjukkan bahwa library ini menangani koneksi jaringan real-time dan logika pergerakan/skill pemain:
+- **Koneksi dan Sesi (ReliableUdp):**
+  - `mfw::ReliableUdp::init(...)`
+  - `mfw::ReliableUdp::makeCmdConnect(...)`
+  - `mfw::ReliableUdp::makeCmdEstablish(...)`
+  - `mfw::ReliableUdp::sendData(...)`
+  - `mfw::ReliableUdp::recvData(...)`
+  - `mfw::ReliableUdp::processInput(...)`
+  - `mfw::ReliableUdp::update(...)`
+- **Kompresi Data:**
+  - `mfw::UtilLZ4::lz4_compress(...)` dan `lz4_uncompress(...)`
+  - `mfw::UtilZlib::zlib_compress(...)` dan `zlib_uncompress(...)`
+- **Logika Permainan (Battle Operations):**
+  - `mfw::OperType_Battle_Move::visit(...)`
+  - `mfw::OperType_Battle_CastSkill::visit(...)`
+  - Fungsi C++ pembantu: `mfw::__GetMoveOpCPlus(...)` dan `mfw::__GetCastSkillOpCPlus(...)`
+
+Simbol-simbol di atas membuktikan bahwa `libmoba.so` sangat bertanggung jawab dalam menjaga sinkronisasi status pertarungan (move, cast skill) menggunakan protokol UDP yang andal (Reliable UDP/KCP), dipadukan dengan kompresi data yang agresif.
+
+## 4. Memory Alignment Analysis
+
+### Strategi Alignment Kompiler pada Section `.text`
+Analisis *disassembly* (`objdump`) pada section eksekusi (`.text`) AArch64 menunjukkan bahwa kompiler menggunakan instruksi NOP (`d503201f` pada AArch64) atau sekadar *Null Bytes* (`00000000`) untuk mengatur jarak (padding) di antara blok-blok fungsi.
+
+Tujuan utama dari pemberian padding ini adalah untuk **Memory Alignment**. Pada arsitektur ARM64, CPU mengambil instruksi jauh lebih efisien ketika *entry point* dari sebuah fungsi atau *branch target* berada di alamat memori yang merupakan kelipatan dari ukuran instruksi (umumnya disejajarkan dengan ukuran cache line, misalnya 16, 32, atau 64 bytes). Padding ini mencegah *pipeline stall* atau *cache miss* ketika CPU melakukan instruksi loncatan (jump/branch).
+
+### Output Mentah: Offset Padding (.text section)
+Berikut adalah daftar (sampel raw output) dari koordinat alamat / offset memori di mana kompiler menyisipkan blok padding (rata-rata 4 bytes, yang merepresentasikan 1 instruksi `NOP`) di dalam area eksekusi untuk menyejajarkan awal fungsi atau loop berikutnya:
+
+```text
+Offset (Hex): 000c3dac | Ukuran Padding: 4 bytes
+Offset (Hex): 000c3db8 | Ukuran Padding: 4 bytes
+Offset (Hex): 000dd578 | Ukuran Padding: 4 bytes
+Offset (Hex): 000dd668 | Ukuran Padding: 4 bytes
+Offset (Hex): 000fa39c | Ukuran Padding: 4 bytes
+Offset (Hex): 000fa9b0 | Ukuran Padding: 4 bytes
+Offset (Hex): 000fd410 | Ukuran Padding: 4 bytes
+Offset (Hex): 000fd41c | Ukuran Padding: 4 bytes
+Offset (Hex): 000fd430 | Ukuran Padding: 4 bytes
+Offset (Hex): 000fd4a4 | Ukuran Padding: 4 bytes
+Offset (Hex): 000fd4b0 | Ukuran Padding: 4 bytes
+Offset (Hex): 00110064 | Ukuran Padding: 4 bytes
+Offset (Hex): 00110680 | Ukuran Padding: 4 bytes
+Offset (Hex): 001107ec | Ukuran Padding: 4 bytes
+Offset (Hex): 00121394 | Ukuran Padding: 4 bytes
+Offset (Hex): 001403e8 | Ukuran Padding: 4 bytes
+Offset (Hex): 00140478 | Ukuran Padding: 4 bytes
+Offset (Hex): 0014054c | Ukuran Padding: 4 bytes
+Offset (Hex): 001408d8 | Ukuran Padding: 4 bytes
+Offset (Hex): 00140968 | Ukuran Padding: 4 bytes
+Offset (Hex): 00140a3c | Ukuran Padding: 4 bytes
+Offset (Hex): 00146df0 | Ukuran Padding: 4 bytes
+Offset (Hex): 0019e138 | Ukuran Padding: 4 bytes
+Offset (Hex): 001a07e8 | Ukuran Padding: 4 bytes
+Offset (Hex): 001a0c9c | Ukuran Padding: 4 bytes
+Offset (Hex): 001a96a4 | Ukuran Padding: 4 bytes
+Offset (Hex): 001adc78 | Ukuran Padding: 4 bytes
+Offset (Hex): 001ade84 | Ukuran Padding: 4 bytes
+Offset (Hex): 001b0b08 | Ukuran Padding: 4 bytes
+Offset (Hex): 001b6e00 | Ukuran Padding: 4 bytes
+```
+*Catatan: Pola ukuran padding 4 bytes ini selaras dengan ukuran tetap 32-bit (4 bytes) untuk setiap instruksi AArch64, digunakan sebagai "filler" untuk menyelaraskan alamat loop/branch berikutnya.*
+## 5. Analisis Mendalam: `mfw::ReliableUdp::sendData`
+
+### Analisis Logika Algoritma (Queueing & Priority)
+Berdasarkan hasil disassembly dari fungsi `_ZN3mfw11ReliableUdp8sendDataEPKcjNS_14UdpMessageTypeE`, berikut adalah temuan utama mengenai bagaimana data ditangani:
+- **Prioritas (UdpMessageType):** Argumen ketiga dari fungsi ini adalah enum `UdpMessageType` (disimpan di register `w22` / `w3`). Kode memeriksa apakah tipe pesan adalah `1` (`cmp w22, #1`). Jika tipe pesan ini spesifik (kemungkinan "Unreliable" atau sebaliknya), ia bisa melakukan bypass antrean khusus dan langsung dikirim.
+- **Queueing / Fragmentasi KCP:** Pustaka ini secara ketat mengandalkan implementasi internal **KCP** (`ikcp_send`). Sebelum diserahkan ke KCP, ia mengecek panjang payload tambahan (`add w8, w20, #8`). Jika panjang payload melebihi ukuran maksimum tertentu (`cmp w8, #0x800` / 2048 bytes), ada logika _fallback_ atau _fragment_ yang dipanggil via _function pointer_ (`blr x8` di alamat `cc150`).
+
+### Kaitan dengan Kompresi Data
+Fungsi `sendData` mengintegrasikan kompresi on-the-fly yang sangat efisien:
+- **Batas Ukuran Kompresi:** Fungsi memeriksa panjang data (`w2`). Jika panjang data `< 64 bytes` (`cmp w20, #0x40`, instruksi `b.lt cc0c8`), payload **tidak akan dikompresi** dan langsung diteruskan ke lapisan KCP. Ini adalah optimasi penting untuk menghindari CPU overhead pada paket-paket kecil seperti input joystick tunggal.
+- **Pemilihan Algoritma:** Jika ukuran data >= 64 bytes, program membaca flag konfigurasi pada memori (offset `+28` dari objek `ReliableUdp`). Jika flag bernilai `1`, ia memanggil `mfw::UtilLZ4::lz4_compress`. Jika tidak (flag `0`), ia memanggil `mfw::UtilZlib::zlib_compress`. LZ4 menawarkan kecepatan kompresi yang lebih tinggi (cocok untuk game real-time), sedangkan Zlib menawarkan rasio kompresi yang lebih baik.
+
+### Pseudo-code C++ `sendData`
+Berikut adalah abstraksi Pseudo-code dari alur *assembly* yang dianalisis:
+
+```cpp
+bool mfw::ReliableUdp::sendData(const char* data_ptr, unsigned int data_len, mfw::UdpMessageType msg_type) {
+    if (this->kcp_cb == nullptr || data_len == 0) return false;
+
+    const char* payload = data_ptr;
+    unsigned int payload_len = data_len;
+    std::string compressed_buffer;
+
+    // 1. Kompresi On-the-Fly
+    if (data_len >= 64) {
+        if (this->compression_type == 1) { // 1 = LZ4
+            mfw::UtilLZ4::lz4_compress(data_ptr, data_ptr + data_len, compressed_buffer, ...);
+        } else { // 0 = Zlib
+            mfw::UtilZlib::zlib_compress(data_ptr, data_ptr + data_len, compressed_buffer, ...);
+        }
+
+        // Update pointer & length to use the compressed buffer
+        if (compressed_buffer.length() < data_len) {
+            payload = compressed_buffer.c_str();
+            payload_len = compressed_buffer.length();
+        }
+    }
+
+    // 2. KCP Routing & Fragment Check
+    if (msg_type == UdpMessageType::RELIABLE) {
+        // Jika panjang payload melebihi MTU / Window size tertentu (misal 2048 bytes)
+        if (payload_len + 8 > this->max_window_size || payload_len + 8 > 2048) {
+             // Handle fragmentasi / error handler (via function pointer)
+             this->fragmentHandler(payload, payload_len);
+             return false;
+        }
+    }
+
+    // 3. Pengiriman Aktual menggunakan KCP Protocol
+    // Memasukkan data ke dalam KCP Queue internal
+    int result = ikcp_send(this->kcp_cb, payload, payload_len);
+
+    return (result == 0);
+}
+```
+*Catatan: Nama variabel struktural seperti `compression_type` atau `max_window_size` di-infer dari offset register.*
