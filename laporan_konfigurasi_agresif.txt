@@ -1,0 +1,64 @@
+# Laporan Konfigurasi Agresif KCP (`libmoba.so`)
+
+Dokumen ini memetakan parameter *tuning* performa tinggi pada struktur `IKCPCB` untuk memahami batasan *throughput* maksimal protokol (mode "Aggressive State"). Pengaturan ini dikendalikan melalui fungsi `ikcp_nodelay(kcp, nodelay, interval, resend, nc)`.
+
+## 1. Pemetaan Offset Konfigurasi Akhir (IKCPCB)
+Berdasarkan *disassembly* fungsi `ikcp_nodelay` (`0x000d097c`), parameter modifikasi mode *(turbo/aggressive)* disematkan pada titik memori berikut (*relative to* *base pointer* KCP *Control Block*):
+
+| Parameter | Register Asal | Offset (Hex) | Deskripsi Fungsional |
+| :--- | :--- | :--- | :--- |
+| `nodelay` | `w1` | `+0x6C` / 108 | Flag untuk menonaktifkan algoritma penundaan (Nagle). Jika diset ke `1` atau `2`, KCP tidak akan menahan paket kecil untuk digabungkan *(batching)* dan akan langsung mengirimkannya. |
+| `interval` | `w2` | `+0x50` / 80 | Kecepatan *tick* (dalam ms) untuk pemanggilan internal `ikcp_flush`. KCP memaksa nilai terkecil dibatasi pada `10ms` (terlihat di `cmp w2, #0xa` dan `csel w8, w2, w8, hi`), tidak bisa di-set ke 0 via API resmi. |
+| `resend` | `w3` | `+0xE8` / 232 | Ambang batas **Fast Retransmit** (`fastresend`). Menentukan seberapa banyak *redundant* ACK yang diterima sebelum KCP mengirim ulang paket tanpa menunggu *timer* RTO habis. Default biasanya `2` atau `0` (mati). |
+| `nc` | `w4` | `+0xEC` / 236 | Flag **No Congestion Window** (`nocwnd`). Jika di-set ke `1`, maka KCP akan **sepenuhnya mengabaikan pengereman** yang disebabkan oleh kehilangan paket (RTO), menjaga `cwnd` (offset +68) tetap maksimal. |
+
+## 2. Analisis Logika `fastresend` di `ikcp_flush`
+Di dalam fungsi eksekusi utama `ikcp_flush` (`0x000cfbf0`), nilai konfigurasi `fastresend` sangat krusial. Pada instruksi di `0x000d00d0`:
+```text
+  d00d0:  ldr  w9, [x19, #232]   // Load `fastresend` configuration
+  d00d4:  ldr  w10, [x19, #1320] // Load internal fast-ack tracking
+  d00d8:  cmp  w9, #0            // Check if fastresend is enabled (> 0)
+```
+Jika `fastresend` > 0, setiap segmen yang ada di *send buffer* (`snd_buf`) yang nilai *fast-ack* internalnya (`seg->fastack`) lebih besar atau sama dengan batas konfigurasi `fastresend`, akan segera dipaksa masuk ke status **harus ditransmisikan** (memintas *timer* RTO).
+
+## 3. Pseudo-code 'Aggressive State' (Throughput Maksimal)
+Jika sebuah sistem ingin mendorong *throughput* jaringan secara ekstrem tanpa memedulikan efisiensi *bandwidth* lokal (mengubah parameter tersebut ke titik agresif via *memory modification*), logika *loop* internal akan bergeser seperti ini:
+
+```cpp
+// Simulasi State Agresif:
+// kcp->nodelay = 1
+// kcp->fastresend = 1
+// kcp->nocwnd = 1
+
+void ikcp_flush_aggressive_simulation(IKCPCB *kcp) {
+    // Karena nocwnd = 1, batas transmisi hanya dibatasi oleh Window Statis,
+    // bukan oleh respon jaringan yang melambat.
+    uint32_t send_capacity = min(kcp->snd_wnd, kcp->rmt_wnd); // kcp->cwnd diabaikan
+
+    for (Segment* seg in kcp->snd_buf) {
+        bool needs_send = false;
+
+        // 1. Pengecekan RTO Normal
+        if (current_time >= seg->ts_resend) {
+            needs_send = true;
+        }
+        // 2. Pengecekan Fast Retransmit (Aggressive: fastresend = 1)
+        // Cukup SATU paket saja loncat urutan (out-of-order), paket ini
+        // akan langsung dikirim ulang tanpa ampun.
+        else if (seg->fastack >= kcp->fastresend) {
+            needs_send = true;
+            seg->fastack = 0; // Reset counter
+        }
+
+        if (needs_send) {
+            // Karena nodelay = 1, paket tidak akan menunggu untuk digabung (batched)
+            // ke dalam buffer yang lebih besar jika memungkinkan.
+            // Paket akan langsung dibungkus dan dikirim ke UDP Socket.
+            output_callback(seg->data);
+        }
+    }
+}
+```
+
+**Kesimpulan Keamanan Arsitektur:**
+Dengan menimpa (*patching*) offset `+108` (`nodelay`), `+232` (`fastresend`), dan `+236` (`nocwnd`) di memori secara dinamis, klien dapat memaksa mesin protokol KCP lokal untuk membanjiri (flood) server dengan duplikasi *state* game (*packet spamming* yang *valid* secara KCP/CRC32). Di sistem terdistribusi MOBA yang tidak memiliki perlindungan *Rate-Limiting* kuat pada soket UDP servernya, manuver agresif ini dapat memicu fenomena manipulasi *Lag/Desync* terencana.
