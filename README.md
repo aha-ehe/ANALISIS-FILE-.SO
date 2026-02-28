@@ -1,0 +1,2 @@
+# ANALISIS-FILE-.SO
+Gacor
