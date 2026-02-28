@@ -191,3 +191,59 @@ Offset (Hex): 001b0b08 | Ukuran Padding: 4 bytes
 Offset (Hex): 001b6e00 | Ukuran Padding: 4 bytes
 ```
 *Catatan: Pola ukuran padding 4 bytes ini selaras dengan ukuran tetap 32-bit (4 bytes) untuk setiap instruksi AArch64, digunakan sebagai "filler" untuk menyelaraskan alamat loop/branch berikutnya.*
+## 5. Analisis Mendalam: `mfw::ReliableUdp::sendData`
+
+### Analisis Logika Algoritma (Queueing & Priority)
+Berdasarkan hasil disassembly dari fungsi `_ZN3mfw11ReliableUdp8sendDataEPKcjNS_14UdpMessageTypeE`, berikut adalah temuan utama mengenai bagaimana data ditangani:
+- **Prioritas (UdpMessageType):** Argumen ketiga dari fungsi ini adalah enum `UdpMessageType` (disimpan di register `w22` / `w3`). Kode memeriksa apakah tipe pesan adalah `1` (`cmp w22, #1`). Jika tipe pesan ini spesifik (kemungkinan "Unreliable" atau sebaliknya), ia bisa melakukan bypass antrean khusus dan langsung dikirim.
+- **Queueing / Fragmentasi KCP:** Pustaka ini secara ketat mengandalkan implementasi internal **KCP** (`ikcp_send`). Sebelum diserahkan ke KCP, ia mengecek panjang payload tambahan (`add w8, w20, #8`). Jika panjang payload melebihi ukuran maksimum tertentu (`cmp w8, #0x800` / 2048 bytes), ada logika _fallback_ atau _fragment_ yang dipanggil via _function pointer_ (`blr x8` di alamat `cc150`).
+
+### Kaitan dengan Kompresi Data
+Fungsi `sendData` mengintegrasikan kompresi on-the-fly yang sangat efisien:
+- **Batas Ukuran Kompresi:** Fungsi memeriksa panjang data (`w2`). Jika panjang data `< 64 bytes` (`cmp w20, #0x40`, instruksi `b.lt cc0c8`), payload **tidak akan dikompresi** dan langsung diteruskan ke lapisan KCP. Ini adalah optimasi penting untuk menghindari CPU overhead pada paket-paket kecil seperti input joystick tunggal.
+- **Pemilihan Algoritma:** Jika ukuran data >= 64 bytes, program membaca flag konfigurasi pada memori (offset `+28` dari objek `ReliableUdp`). Jika flag bernilai `1`, ia memanggil `mfw::UtilLZ4::lz4_compress`. Jika tidak (flag `0`), ia memanggil `mfw::UtilZlib::zlib_compress`. LZ4 menawarkan kecepatan kompresi yang lebih tinggi (cocok untuk game real-time), sedangkan Zlib menawarkan rasio kompresi yang lebih baik.
+
+### Pseudo-code C++ `sendData`
+Berikut adalah abstraksi Pseudo-code dari alur *assembly* yang dianalisis:
+
+```cpp
+bool mfw::ReliableUdp::sendData(const char* data_ptr, unsigned int data_len, mfw::UdpMessageType msg_type) {
+    if (this->kcp_cb == nullptr || data_len == 0) return false;
+
+    const char* payload = data_ptr;
+    unsigned int payload_len = data_len;
+    std::string compressed_buffer;
+
+    // 1. Kompresi On-the-Fly
+    if (data_len >= 64) {
+        if (this->compression_type == 1) { // 1 = LZ4
+            mfw::UtilLZ4::lz4_compress(data_ptr, data_ptr + data_len, compressed_buffer, ...);
+        } else { // 0 = Zlib
+            mfw::UtilZlib::zlib_compress(data_ptr, data_ptr + data_len, compressed_buffer, ...);
+        }
+
+        // Update pointer & length to use the compressed buffer
+        if (compressed_buffer.length() < data_len) {
+            payload = compressed_buffer.c_str();
+            payload_len = compressed_buffer.length();
+        }
+    }
+
+    // 2. KCP Routing & Fragment Check
+    if (msg_type == UdpMessageType::RELIABLE) {
+        // Jika panjang payload melebihi MTU / Window size tertentu (misal 2048 bytes)
+        if (payload_len + 8 > this->max_window_size || payload_len + 8 > 2048) {
+             // Handle fragmentasi / error handler (via function pointer)
+             this->fragmentHandler(payload, payload_len);
+             return false;
+        }
+    }
+
+    // 3. Pengiriman Aktual menggunakan KCP Protocol
+    // Memasukkan data ke dalam KCP Queue internal
+    int result = ikcp_send(this->kcp_cb, payload, payload_len);
+
+    return (result == 0);
+}
+```
+*Catatan: Nama variabel struktural seperti `compression_type` atau `max_window_size` di-infer dari offset register.*
