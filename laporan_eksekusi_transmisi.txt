@@ -1,0 +1,35 @@
+# Laporan Eksekusi Transmisi KCP (`ikcp_flush`)
+
+Fungsi `ikcp_flush` (`0x000cfbf0`) adalah eksekutor sebenarnya dari pengiriman data dalam protokol KCP. Jika `ikcp_send` hanya memasukkan data ke memori, `ikcp_flush` bertugas mengeluarkan memori tersebut ke jaringan, mengatur *timing*, dan menangani paket yang hilang.
+
+## 1. Logika 'Sliding Window' (Pengendalian Kongesti)
+Di dalam `ikcp_flush`, protokol menentukan secara absolut berapa banyak fragmen yang boleh ditransmisikan dalam satu siklus (*tick*) dengan mengevaluasi tiga metrik batas *window*:
+- **Proses Pengambilan Batas (Offset `cfff0`):**
+  1. `ldr w8, [x19, #56]` (Load `snd_wnd` - Kapasitas maksimal lokal).
+  2. `ldr w9, [x19, #64]` (Load `rmt_wnd` - Kapasitas maksimal penerima/server).
+  3. `cmp w8, w9` dan `csel w17, w9, w8, hi` (Memilih nilai yang paling kecil antara `snd_wnd` dan `rmt_wnd`).
+  4. `ldr w8, [x19, #68]` (Load `cwnd` - Congestion Window dinamis berdasarkan kondisi *network loss*).
+  5. `cmp w8, w17` dan `csel w17, w17, w8, hi` (Mendapatkan nilai final minimum dari ketiganya).
+- **Mekanisme Pengereman (Throttling):** Variabel `w17` (yang mewakili *Available Window*) digunakan sebagai limit iterasi. Segmen yang berada di luar limit ini akan tetap tertahan di `snd_queue` dan **tidak** akan dipindahkan ke `snd_buf` untuk ditransmisikan.
+
+## 2. Mekanisme Retransmisi (RTO)
+Sistem mendeteksi kehilangan paket tidak dengan meminta server, melainkan dengan batas waktu lokal (Retransmission Time Out):
+- Di offset `d0018`, fungsi memuat nilai `rx_rto` dari `[x19, #48]`.
+- Sistem menggunakan nilai ini untuk mengkalkulasi `ts_resend` (Timestamp kapan paket harus dikirim ulang jika ACK belum diterima).
+- Jika waktu saat ini (`current`) lebih besar atau sama dengan `ts_resend` sebuah segmen yang ada di `snd_buf`, maka variabel penanda retransmisi akan aktif. Segmen tersebut ditarik kembali dan disisipkan ke dalam *buffer* pengiriman fisik (*output buffer*).
+
+## 3. Titik Output Fisik (Lower-Layer Call)
+*Payload* KCP tidak bisa mengirim dirinya sendiri via UDP; ia membutuhkan fungsi dari sistem atau *engine* asalnya.
+- Pada offset `cff9c` dan `d016c`, `ikcp_flush` memuat *pointer* memori `[x19, #248]` (`ldr x8, [x19, #248]`). Pointer ini diinisiasi oleh game (via `mfw::ReliableUdp::init`) dan mengarah ke fungsi pengiriman *socket* UDP yang sebenarnya.
+- Konteks pengguna (*user pointer* / referensi objek `ReliableUdp`) dimuat dari `[x19, #216]` (`ldr x3, [x19, #216]`).
+- Eksekusi akhir dilakukan dengan `blr x8` (offset `cffb0` dan `d017c`), yang secara fisik menumpahkan ratusan byte byte gabungan (*flushed buffer*) ke sistem operasi untuk dikirimkan melalui jaringan.
+
+## 4. Analisis Efisiensi ACK & Fast Retransmit
+Untuk mempercepat retransmisi tanpa harus menunggu jeda `rx_rto` (yang mungkin mencapai ratusan milidetik), KCP menerapkan **Fast Retransmit**.
+- Jika server menerima paket yang tidak berurutan, server mengirimkan ACK untuk paket terbaru yang diterimanya.
+- Di sisi klien (`ikcp_input`), perhitungan `fastack` dinaikkan setiap kali klien mendeteksi "lompatan" urutan nomor paket.
+- Di dalam `ikcp_flush`, jika nilai `fastack` dari sebuah paket yang sedang *in-flight* melebihi batas `fastresend` (biasanya di-set ke 2), maka `ikcp_flush` akan segera mengabaikan *timer* RTO dan **memaksa transmisi ulang** secara instan.
+- **Potensi Manipulasi Throughput:** Jika seorang analis memanipulasi *offset* konfigurasi `fastresend` di memori menjadi `1` atau membajak kalkulasi ACK, *client* bisa dibuat sangat agresif (mengirim spam paket duplikat) dalam menjaga jaminan pengiriman, meskipun hal ini bisa memperburuk saturasi *bandwidth* (Network Flooding).
+
+**Kesimpulan Kapasitas *Burst*:**
+Meskipun `ikcp_send` mengizinkan pembuatan hingga 255 fragmen lokal, "Semburan Asli" ke *network* sangat bergantung pada `min(snd_wnd, rmt_wnd, cwnd)` yang dikalkulasi secara asinkron di dalam `ikcp_flush`. Modifikasi pada offset `+56` (`snd_wnd`) dan `+64` (`rmt_wnd`) di dalam *control block* memori adalah kunci utama untuk membongkar batasan *bandwidth* tingkat aplikasi.
