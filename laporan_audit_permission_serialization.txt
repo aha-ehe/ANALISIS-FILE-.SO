@@ -1,0 +1,34 @@
+# Laporan Audit: Memory Permissions & Packet Serialization
+
+Laporan ini mendokumentasikan rutinitas manipulasi izin memori (oleh ShadowHook), format serialisasi paket data, dan arsitektur *JNI Bridge* pada `libmoba.so`, serta konsep teoretis *Live Code Patching*.
+
+## 1. Analisis Penggunaan `mprotect` pada `libshadowhook.so`
+Fungsi `mprotect` merupakan *syscall* POSIX standar yang digunakan untuk mengubah perlindungan memori suatu rentang alamat (*memory range*). Karena memori eksekusi (seperti `.text`) biasanya dimuat dengan izin `R-X` (Read-Execute) demi keamanan (NX Bit / DEP), penulisan *hook* ke area tersebut memerlukan manipulasi izin.
+
+Berdasarkan *disassembly* `libshadowhook.so`, persiapan menuju pemanggilan `mprotect` terjadi sebagai berikut:
+- **Page Alignment:** Instruksi di sekitar `0xee64` (`and x0, x9, x8`, `and x8, x8, x10`) sangat jelas mengalkulasi batas alamat ke halaman terdekat (*page boundary*). `mprotect` di Linux/Android **wajib** menerima alamat yang di-*align* dengan ukuran *page* (umumnya 4096 bytes atau 4KB di ARM64).
+- **Penyiapan Argumen:**
+  - `x0` (Alamat memori awal, yang sudah diselaraskan ke ukuran *page*).
+  - `x1` (Panjang blok memori yang akan diubah, biasanya 1 *page* atau kelipatannya).
+  - `w2` (Flag perlindungan yang diminta, diatur ke nilai `7` / `PROT_READ | PROT_WRITE | PROT_EXEC` (RWX)).
+- Setelah *hook* (instruksi B/BL) selesai ditulis ke dalam memori, ShadowHook memanggil `mprotect` kembali dengan *flag* `5` (`PROT_READ | PROT_EXEC` / R-X) untuk mengembalikan status keamanan segmen tersebut dan menghindari deteksi.
+
+## 2. Pemetaan Serialisasi Paket KCP (`libmoba.so`)
+Berdasarkan hasil *dump* simbol yang diekspor (`nm -D libmoba.so`), struktur data yang dikirimkan KCP **tidak** menggunakan pustaka standar komersial seperti Google Protobuf atau FlatBuffers.
+- **Custom SdpPacker:** Serialisasi dibangun di atas *namespace* kustom `mfw::SdpPacker` dan `mfw::SdpUnpacker` (serta varian `muf::SdpPacker`).
+- **Integrasi Lua:** Terdapat integrasi yang sangat tebal dengan lingkungan Lua (seperti `sdplua` dan `sdpxlua`). Fungsi pembungkus seperti `_ZNK7sdpxlua12LuaSdpStruct5visitIN3muf9SdpPackerELb1EEEvRT_b` menunjukkan bahwa *state* objek dalam Lua (seperti *Map*, *Vector*, atau *Struct* posisi pemain) dikonversi secara langsung menjadi paket biner (SDP) sebelum akhirnya dilempar ke KCP.
+- **Format Target:** Paket-paket SDP ini diformat menjadi struktur internal seperti `ProtoUdp::Cmd_Udp_Data` atau `OperType_Battle_Move`.
+
+## 3. Audit JNI Bridge (C# ke Native)
+Aplikasi memuat pustaka natif (`libmoba.so`) yang bertugas mengelola jaringan. Permintaan pergerakan yang dihasilkan oleh *Game Engine* (Unity/C# di lapisan IL2CPP) diserahkan ke *native layer* melalui antarmuka JNI. Berikut adalah titik serah terima (*handoff points*) utamanya:
+- `Java_com_moba_unityplugin_UnityConfig_nativeSupportMoveLogic`: Fungsi ini sangat mungkin digunakan sebagai inisialisasi awal atau *polling* rutin dari Unity untuk mengizinkan atau mengirim konfigurasi logika pergerakan (Move Logic) ke modul *backend* C++.
+- `Java_com_moba_unityplugin_NativeUtility_invokeFunctionPointerLongLong`: Ini adalah fungsi *bridge* generalis. Daripada mengekspor puluhan fungsi JNI untuk setiap *skill* (misalnya `Java_..._castSkillA`), arsitektur ini menggunakan satu fungsi generik yang menerima *pointer* memori C++ murni (disimpan sebagai tipe `Long` di C#) dan argumennya untuk langsung dieksekusi secara native. Ini mempercepat alur kerja (*low JNI overhead*).
+
+## 4. Konsep Teoretis: 'Code Patching' di RAM (AArch64)
+Jika seseorang—misalnya analis—ingin menimpa (*patch*) kode yang sedang berjalan di segmen `.text` (contoh: mem-bypass instruksi `CMP` seperti yang dibahas pada laporan CRC sebelumnya), urutan operasi yang aman dan stabil secara arsitektural adalah sebagai berikut:
+
+1. **Calculate Page Boundary:** Temukan alamat halaman memori (Page) yang menampung instruksi yang akan ditimpa. Lakukan bitwise AND dengan mask *page size* (misal `~0xFFF`).
+2. **Elevate Privileges (`mprotect`):** Panggil `mprotect(page_address, page_size, PROT_READ | PROT_WRITE | PROT_EXEC)`. Ini membuka izin memori yang tadinya R-X menjadi RWX.
+3. **Write Payload:** Tulis instruksi *shellcode* atau NOP (`0xD503201F`) ke alamat target yang spesifik.
+4. **Cache Coherency (`__clear_cache`):** *Langkah Paling Kritis.* Setelah penulisan, data tersebut baru berada di L1/L2 Data Cache. Panggil `__builtin___clear_cache((char*)start_addr, (char*)end_addr)`. Di sisi kernel, ini akan memicu instruksi `dc cvau` (mendorong tulisan dari DCache ke memori utama) dan `ic ivau` (membersihkan ICache lama), memaksa CPU ARM64 memuat ulang instruksi baru.
+5. **Restore Privileges (`mprotect`):** Panggil `mprotect(page_address, page_size, PROT_READ | PROT_EXEC)` untuk mengembalikan izin awal dan menutup celah keamanan.
