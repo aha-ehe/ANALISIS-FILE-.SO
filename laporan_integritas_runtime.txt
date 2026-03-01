@@ -1,0 +1,29 @@
+# Laporan Integritas Runtime: Sistem Koherensi dan Deteksi Modifikasi
+
+Laporan ini menyajikan analisis stabilitas memori jangka panjang dan mekanisme perlindungan *runtime* yang aktif pada set pustaka *game engine* (khususnya AArch64).
+
+## 1. ICache Synchronization Audit
+Pada arsitektur ARM64, modifikasi instruksi secara dinamis di memori (seperti *Inline Hooking*) memerlukan sinkronisasi *Instruction Cache* (ICache) dengan *Data Cache* (DCache) agar CPU tidak mengeksekusi instruksi lama yang tersisa di *cache*.
+- **Hasil Audit:** Tidak ditemukan pemanggilan ke fungsi *built-in* kompiler `__clear_cache` di dalam tabel impor dinamis maupun *strings* dari `libmoba.so` dan `libunity.so`.
+- **Analisis Opcode:** Tidak ditemukan penggunaan instruksi *cache invalidate* tingkat rendah seperti `ic ivau` (Instruction Cache Invalidate by VA to PoU).
+- **Kesimpulan:** `libmoba.so` dan `libunity.so` tidak melakukan modifikasi *self-modifying code* (SMC) atau *dynamic code generation* (JIT) secara independen. Mereka mengandalkan logika eksekusi statis. Ini berarti setiap modifikasi pihak ketiga pada `.text` membutuhkan panggilan `__builtin___clear_cache` eksternal agar stabil.
+
+## 2. Memory Protection Watchdogs
+Untuk mencegah *memory patching*, sistem proteksi yang agresif sering kali membuat *thread* khusus (*watchdog*) yang memanggil *syscall* `mprotect` atau memvalidasi *hash* memori.
+- **`libmoba.so`:** Sama sekali **tidak mengimpor** atau memanggil `mprotect` (baik *wrapper* libc maupun *syscall* langsung `svc #0`). Tidak ada *watchdog thread* yang memonitor izin segmen `.text`.
+- **`libunity.so`:** Mengimpor `mprotect@LIBC`. Namun, ini merupakan hal wajar untuk *engine* yang mengelola manajemen *heap* internal atau *Garbage Collector* (Mono/IL2CPP), bukan difungsikan sebagai sistem *Anti-Tamper* reaktif.
+
+## 3. ShadowHook Collision Analysis
+*Library* `libshadowhook.so` (dikembangkan oleh ByteDance) adalah kerangka kerja *hooking* tingkat lanjut.
+- **Perilaku Memory Permission:** Ditemukan string `MProtect failed` dan pemanggilan `mprotect`. Library ini **aktif mengubah izin segmen memori** (biasanya dari `r-xp` menjadi `rwxp` sesaat) untuk memasang *trampoline* / instruksi *hook* (`shadowhook-hub-trampo`), dan kemudian mengembalikannya.
+- **Collision:** ShadowHook berfokus pada penyisipan *hook* secara aman tanpa menabrak dirinya sendiri. Ia memonitor eksekusi *dynamic linker* (seperti `__dl__Z9do_dlopenPKciPK17android_dlextinfoPv` dan `soinfo::call_constructors`).
+- **Analisis Ancaman:** ShadowHook di sini lebih bertindak sebagai **fasilitator** (memungkinkan fitur APM / Application Performance Monitoring seperti pencatatan *crash*) daripada "Penjaga Keamanan". Ia tidak mencegah library lain melakukan hal yang sama.
+
+## 4. Proc Maps Sniffing
+Aktivitas membaca peta memori virtual OS dapat digunakan untuk dua hal: memetakan alamat untuk eksploitasi, atau mendeteksi *cheat* (mencari keberadaan nama *library* tak dikenal atau blok anonim `r-xp`).
+- **`libmoba.so`:** Ditemukan string **`/proc/%d/maps`**. Karena tidak ada mekanisme *anti-tamper* aktif lainnya yang ditemukan, pembacaan ini hampir dipastikan berkaitan dengan **Crash Reporter** (seperti Google Breakpad atau NPTH) untuk menyusun *memory map* ke dalam *tombstone* / *log* saat game mengalami *crash*.
+- **`libshadowhook.so`:** Ditemukan string **`/proc/self/maps`**. Ini adalah perilaku standar dari pustaka *hooking*; ia harus mem-parsing *file* ini untuk menemukan *Base Address* dari pustaka targetnya (contoh: `libc.so`) agar dapat menemukan offset fungsi yang ingin di-*hook*.
+- **`libsigner.so`:** Tidak melakukan *sniffing* memori.
+
+## Kesimpulan Stabilitas Jangka Panjang
+Arsitektur aplikasi sangat memercayai lingkungan sistem. Tidak ada siklus *watchdog* agresif yang secara konstan memverifikasi CRC/Hash dari segmen eksekusi (`.text`) setelah biner berhasil di-`dlopen` ke dalam memori. Ancaman desinkronisasi atau *crash* pasca-modifikasi di ARM64 lebih mungkin disebabkan oleh kegagalan sinkronisasi ICache secara manual oleh pengubah, daripada penalti deteksi *anti-tamper* internal.
