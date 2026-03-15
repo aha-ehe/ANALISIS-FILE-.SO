@@ -1,0 +1,47 @@
+# Arsitektur Dynamic Linking dan Coherency Memori (AArch64)
+
+Laporan ini mendokumentasikan interaksi antara `libmoba.so` dan pustaka sistem (terutama `libc.so`) menggunakan mekanisme *dynamic linking* pada OS Android 15 (AArch64), serta prinsip teoretis sinkronisasi *cache* CPU.
+
+## 1. Audit Dependensi `libc.so` (Tabel Relokasi)
+Pustaka *shared object* tidak memiliki implementasi fungsi C standar di dalam biner mereka sendiri. Mereka mendelegasikannya ke `libc.so` via tabel relokasi.
+Hasil audit `.rela.plt` pada `libmoba.so` menunjukkan ketergantungan pada fungsi-fungsi memori dan jaringan berikut yang di-*resolve* saat *runtime*:
+- **Manajemen Memori:** `malloc@LIBC`, `free@LIBC`, `memcpy@LIBC`, `memset@LIBC`.
+- **Manajemen Jaringan:** `socket@LIBC`, `sendto@LIBC`, `recvfrom@LIBC`, `freeaddrinfo@LIBC`.
+Fungsi-fungsi ini memiliki tipe relokasi `R_AARCH64_JUMP_SL` yang berarti mereka dipanggil melalui *Procedure Linkage Table* (PLT).
+
+## 2. Struktur GOT dan PLT pada ARM64
+Untuk berinteraksi dengan pustaka eksternal seperti `libc.so`, ELF menggunakan mekanisme **GOT (Global Offset Table)** dan **PLT (Procedure Linkage Table)**.
+- **PLT (.plt):** Adalah segmen kode *executable* (`r-xp`). Ia berisi *stub* (instruksi *trampoline*) berukuran kecil (biasanya 16 bytes di ARM64) untuk setiap fungsi eksternal. Ketika kode `libmoba.so` ingin memanggil `malloc`, ia tidak melompat ke `libc.so`, melainkan melompat ke `malloc@plt`.
+- **GOT (.got / .got.plt):** Adalah segmen data (`rw-p` atau `r--p`). Ia menyimpan alamat absolut memori (64-bit pointer) dari fungsi-fungsi eksternal tersebut setelah dilacak (resolved) oleh *dynamic linker* Android (`ld-android.so`).
+
+**Alur Pemanggilan:**
+1. Kode internal memanggil `bl malloc@plt`.
+2. PLT mengeksekusi instruksi pembacaan (`ldr x16, [GOT_address]`) untuk mengambil *pointer* fungsi aktual dari tabel GOT.
+3. PLT melakukan *branch* (melompat) tanpa kembali (`br x16`) ke alamat tersebut.
+
+## 3. Mekanisme Lazy Binding vs BIND_NOW
+**Lazy Binding (Teori Klasik):**
+Secara historis, Linux menggunakan *Lazy Binding* untuk mempercepat proses *startup* aplikasi.
+- Saat aplikasi dijalankan, GOT tidak berisi alamat fungsi `libc.so` yang asli, melainkan mengarah kembali ke fungsi *Resolver* milik *dynamic linker* di PLT0.
+- Saat fungsi (misal: `sendto`) dipanggil untuk **pertama kalinya**, alur eksekusi masuk ke *Resolver*. *Linker* mencari alamat `sendto` di dalam `libc.so`, menulis alamat tersebut ke GOT, dan mengeksekusinya.
+- Pada pemanggilan kedua dan seterusnya, PLT langsung membaca alamat `sendto` yang sudah benar dari GOT, tanpa melewati *Resolver* lagi.
+
+**Kenyataan di Android Modern (API 23+ / Android 15):**
+Audit ELF header pada `libmoba.so` sebelumnya menunjukkan keberadaan atribut `BIND_NOW` dan relokasi segmen tipe `GNU_RELRO` (Relocation Read-Only).
+- **Security Override:** Demi keamanan (mencegah manipulasi GOT/GOT Overwrite), Android memaksa *dynamic linker* untuk me-resolve **semua** entri GOT saat *library* dimuat (`dlopen`), sebelum kode aplikasi dijalankan.
+- Setelah semua alamat selesai ditulis, izin segmen GOT diubah dari Read-Write (`rw-p`) menjadi Read-Only (`r--p`) oleh sistem. *Lazy Binding* dinonaktifkan sepenuhnya.
+
+## 4. Konsep Coherency ICache-DCache (Instruksi vs Data)
+Arsitektur ARM64 (AArch64) menggunakan desain arsitektur **Modified Harvard**, di mana CPU memiliki jalur terpisah (serta *cache* yang terpisah) untuk membaca **Instruksi (ICache)** dan membaca **Data (DCache)**.
+
+### Mengapa Sinkronisasi Sangat Krusial?
+Jika sebuah program (atau intervensi eksternal) menulis data/instruksi baru ke sebuah area memori eksekusi (misalnya menimpa `.text` untuk *hooking* atau memasukkan *shellcode*):
+1. **Tulisan ke DCache:** Operasi penulisan memori (*memory write*) akan tersimpan di dalam L1/L2 Data Cache.
+2. **Kebutaan ICache:** Instruction Cache **tidak tahu** bahwa memori aslinya telah berubah. Ketika CPU mencoba mengeksekusi kode di alamat tersebut, *Instruction Fetcher* akan mengambil instruksi lama yang sudah usang dari ICache.
+3. **Efek:** Program akan mengalami *crash* (SIGILL/Illegal Instruction) atau berperilaku tidak terduga *(undefined behavior)*.
+
+### Pembersihan Cache (*Cache Flushing*)
+Untuk membuat CPU ARM64 menyadari perubahan kode, kita harus:
+- Melakukan *Clean* pada DCache agar data instruksi yang baru ditulis terdorong (flushed) ke memori utama (Point of Unification / PoU).
+- Melakukan *Invalidate* pada ICache agar jalur instruksi membuang salinan usang dan mengambil instruksi yang baru dari PoU.
+Pada C/C++, hal ini secara transparan ditangani oleh fungsi kompiler internal `__builtin___clear_cache(start_addr, end_addr)`, yang di baliknya mengeksekusi baris *opcode* AArch64 spesifik (seperti `dc cvau` dan `ic ivau`). Kepatuhan pada koherensi cache ini adalah syarat mutlak stabilitas *runtime patching* pada arsitektur RISC modern.

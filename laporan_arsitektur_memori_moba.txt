@@ -1,0 +1,46 @@
+# Laporan Arsitektur: Manajemen Memori Android & Authoritative Server Model
+
+## 1. Pemetaan Segmen Memori Pustaka Dinamis via `dlopen`
+
+Sistem Operasi Android (berbasis kernel Linux) menggunakan _virtual memory mapping_ untuk memuat _Shared Objects_ (`.so`) ke dalam ruang alamat proses. Informasi ini dapat dilihat melalui pseudo-file `/proc/self/maps` atau `/proc/<pid>/maps`.
+
+### Bagaimana OS Memetakan Memori
+Ketika fungsi `dlopen` atau _dynamic linker_ memuat file `.so`, kernel tidak memuat seluruh file ke RAM secara langsung. Ia menggunakan `mmap()` untuk menciptakan pemetaan yang didukung oleh file (file-backed mapping). Pemetaan ini dibagi berdasarkan segmentasi yang didefinisikan dalam _Program Headers_ file ELF (Executable and Linkable Format), biasanya menghasilkan setidaknya tiga segmen:
+1.  **`r-xp` (Read, Execute, Private):** Segmen ini berisi `.text` (instruksi kode yang dapat dieksekusi) dan `.rodata` (data statis). Ini adalah bagian utama dari logika program.
+2.  **`r--p` (Read-Only, Private):** Sering digunakan untuk segmen relokasi (*relro*) atau data read-only tambahan.
+3.  **`rw-p` (Read, Write, Private):** Segmen ini berisi data global, variabel statis (`.data`, `.bss`), dan struktur kontrol untuk *dynamic linking* (seperti `.got`).
+
+### Membedakan Stub Loader (Kecil) dan Main Runtime (Besar)
+Dalam konteks mesin game seperti Unity (IL2CPP), perbedaan antara _Stub Loader_ dan _Main Runtime_ sangat terlihat pada metrik pemetaan memori:
+
+-   **Stub Loader (Contoh: ~384 KB):**
+    -   Rentang alamat `r-xp` akan sangat kecil (mungkin hanya beberapa ratus kilobyte).
+    -   Seringkali namanya terlihat jelas di kolom _path_ (misalnya `/data/app/.../lib/arm64/libil2cpp.so`).
+-   **Main Runtime (Contoh: ~40 MB):**
+    -   Rentang alamat `r-xp` akan sangat besar, mencerminkan kompilasi AOT (Ahead-of-Time) dari seluruh logika C# game (puluhan hingga ratusan megabyte).
+    -   Jika dimuat dari *storage* dinamis oleh stub, nama *path* mungkin mengarah ke direktori khusus (misal: `/data/data/<package_name>/files/app_libs/rahasia.so`) atau bahkan mungkin terlihat anonim (kosong) jika *loader* menggunakan teknik pemuatan dari memori langsung (misal menggunakan `memfd_create` atau menghapus file asli setelah diload).
+
+## 2. Konsistensi State: Authoritative Server Model pada MOBA
+
+Dalam game kompetitif seperti MOBA (Multiplayer Online Battle Arena), menjaga sinkronisasi *state* di antara 10 pemain yang memiliki tingkat latensi (ping) berbeda adalah tantangan besar. Arsitektur yang digunakan adalah **Authoritative Server Model**, di mana server adalah pemegang kebenaran mutlak (Single Source of Truth).
+
+### Input Prediction dan Lag Compensation
+Untuk memberikan pengalaman bermain yang responsif (tanpa jeda saat menekan tombol), *client* mengimplementasikan:
+-   **Client-Side Prediction:** Ketika pemain memerintahkan Hero untuk bergerak atau menggunakan skill, *client* segera menjalankan animasi dan pergerakan secara lokal tanpa menunggu konfirmasi server.
+-   **Lag Compensation (Server-Side):** Server mengingat riwayat *state* dari setiap entitas di dunia game. Ketika server menerima input perintah tembakan/serangan dari klien dengan ping 100ms, server me-rewind posisi target ke titik 100ms yang lalu untuk memvalidasi apakah serangan tersebut benar-benar mengenai target pada momen tersebut (mengompensasi latensi pandangan klien).
+
+### Desynchronization ("Rubberbanding")
+Desinkronisasi terjadi ketika *state* hasil prediksi *client* berbeda dengan hasil validasi mutlak dari server. Jika paket yang dikirim *client* memiliki integritas checksum CRC32 yang valid (tidak terkorupsi dalam transmisi) namun berisi instruksi atau urutan yang melanggar hukum game (misalnya, mencoba bergerak melewati tembok, menggunakan skill saat cooldown, atau jaraknya terlalu jauh), server akan **menolak** input tersebut.
+
+Karena input ditolak, server akan mengirimkan paket *State Correction* ke klien. Klien, yang sebelumnya memprediksi pergerakan dengan sukses, tiba-tiba dipaksa mundur (di-snap) ke posisi atau *state* yang sah menurut server. Ini sering dikenal sebagai fenomena "Rubberbanding". Dalam model server otoritatif yang aman, klien *tidak pernah* diperbolehkan melaporkan *"saya memberikan 1000 damage"* atau *"saya sedang tidak cooldown"*; klien hanya boleh melaporkan *"saya mencoba menyerang target A"*, dan server yang memverifikasi, menghitung *damage*, mengurangi HP, dan menyebarkan *state* baru ke semua pemain.
+
+## 3. Memverifikasi Segmen Memori Secara Teoretis
+
+Jika Anda menemukan segmen anonim berukuran 40MB dengan atribut `r-xp` tanpa nama file pendukung, ada cara teoretis dan aman secara analitis untuk mengonfirmasi apakah itu *executable code*:
+
+1.  **Membaca Magic Number (ELF Header):** Sebuah file biner (khususnya *Shared Object*) di Linux/Android hampir selalu dimulai dengan *Magic Bytes* ELF. Jika Anda dapat memeriksa 4 byte pertama dari rentang memori tersebut, Anda akan melihat `0x7F 0x45 0x4C 0x46` (atau karakter `\x7fELF`).
+2.  **Menganalisis Pola Opcode Arsitektur (Heuristik):**
+    -   Pada ARM64 (AArch64), setiap instruksi berukuran tepat 4 byte (32-bit).
+    -   Segmen kode yang dapat dieksekusi akan berisi pola opcode yang dikenali (misalnya instruksi fungsi prolog seperti `STP x29, x30, [sp, #-16]!`).
+    -   Banyak blok fungsi dipisahkan oleh *padding alignment* (seperti `D503201F` untuk NOP atau `00000000` di AArch64). Mengamati pola instruksi tetap 32-bit ini (via *disassembler* seperti Radare2, IDA, atau objdump pada *dump* eksperimental) akan dengan cepat mengonfirmasi sifat segmen tersebut.
+3.  **Mencari String Identitas (Fingerprinting):** Memindai awal blok memori untuk mencari string yang dapat dikenali. Mesin game Unity (IL2CPP) meninggalkan artefak yang sangat jelas di bagian awal atau tabel simbolnya, seperti referensi ke fungsi `il2cpp_domain_get` atau string metadata `global-metadata.dat`.

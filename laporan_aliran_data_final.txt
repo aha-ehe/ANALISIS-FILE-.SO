@@ -1,0 +1,29 @@
+# Laporan Aliran Data Final KCP (`libmoba.so`)
+
+Dokumen ini merangkum alur data global *(Global Data Flow)* yang menunjukkan bagaimana sistem secara komprehensif mengelola objek komunikasi, dari titik inisialisasi di JNI hingga eksekusi akhir di soket fisik UDP.
+
+## 1. Lokasi Penyimpanan IKCPCB (Tracking KCP Pointer)
+Untuk berinteraksi dengan memori KCP saat runtime, kita perlu menemukan pointer (*Base Address*) objek `IKCPCB` setelah dibuat.
+- **Titik Inisialisasi:** Berdasarkan audit *disassembly*, fungsi `ikcp_create` dipanggil dari dalam `mfw::ReliableUdp::init` (`0x000caf60`).
+- **Penyimpanan Static/Dynamic:** Setelah dialokasikan (me-return `x0`), pointer tersebut disimpan ke dalam variabel kelas `ReliableUdp` dengan instruksi: `str x0, [x19]`.
+- **Kesimpulan:** Objek `IKCPCB` **tidak** disimpan di dalam tabel segmen statis `.data` atau `.bss` sebagai *global pointer*. Ia disimpan sebagai **Member Variable di Offset 0 (`+0x0`)** dari instance kelas `mfw::ReliableUdp` yang dialokasikan di *Heap*. Jika seseorang menemukan alamat *base* dari instance `ReliableUdp` tersebut, dereferensi pertama langsung mengarah ke `IKCPCB`.
+
+## 2. Analisis JNI ke Proses Pengepakan (Serialization)
+Serah terima instruksi pergerakan atau logika pahlawan dari C# (Unity) ke C++ sangat dioptimalkan:
+- **JNI Generic Bridge:** Fungsi `Java_com_moba_unityplugin_NativeUtility_invokeFunctionPointerLongLong` (`0x000fd6e8`) tidak melakukan validasi logika, melainkan langsung memanggil *pointer* C++ murni yang dilempar dari C# (`br x2`). Ini adalah saluran masuk data utama yang sangat efisien.
+- **Serialisasi ke SdpPacker:** Data tersebut tidak dibungkus menggunakan pustaka populer seperti Protobuf atau FlatBuffers. Berdasarkan pencarian string dan simbol tabel, aplikasi ini menggunakan *framework* khusus bernama **`mfw::SdpPacker`**. Objek-objek data *(Struct, Map, Vector)* dikonversi dari representasi Lua/C# ke biner kompak SDP (contohnya lewat fungsi `mfw::OperType_Battle_Move::visit`).
+- Setelah paket SDP mentah *(byte array)* terbentuk, barulah ia dilempar ke `mfw::ReliableUdp::sendData`, yang mana seperti dibahas sebelumnya, berpotensi di-kompresi LZ4 sebelum memanggil `ikcp_send`.
+
+## 3. Audit Wrapper `sendto` Fisik
+Setelah data masuk KCP dan diproses oleh `ikcp_flush`, ia dilempar ke *callback* lapisan bawah di `[x19, #248]`.
+- **Pelacakan Callback:** Fungsi *wrapper* yang dituju adalah `socket_sendto` (`0x0012faf0`).
+- **Analisis Obfuscation Ekstra:** Fungsi `socket_sendto` bertindak sebagai pembungkus (*POSIX wrapper*) standar dengan manajemen *error* (`__errno`, `socket_strerror`). Tidak ditemukan adanya penambahan *sequence number* tingkat aplikasi, enkripsi payload tambahan, atau modifikasi data di dalam *wrapper* ini.
+- **Kesimpulan Eksekusi:** Apa yang keluar dari *flush* KCP (Payload kompresi + Header KCP) adalah representasi biner eksak yang ditulis langsung ke `sendto@LIBC` dan keluar dari *network interface* (WIFI/Seluler).
+
+## 4. Heartbeat, Clock, & Timeout Logic
+Agar koneksi tetap hidup, KCP memerlukan detak jantung penggerak (*clock driver*).
+- **Penggerak Clock:** Kelas `mfw::ReliableUdp::update` (`0x000cc7b0`) berjalan secara berkelanjutan (*polling loop* atau *game tick*), yang memanggil fungsi `ikcp_update_realtime` untuk memutar jarum waktu KCP.
+- **Timeout Connection:** KCP mendeteksi *Dead Link* (putus koneksi) bukan dari ketidaksesuaian interval *client-server*, melainkan jika paket dikirimkan secara berulang namun tidak kunjung mendapat ACK.
+- **Batas Kematian (Deadlink):** Berdasarkan konstanta `IKCP_DEADLINK` (`0x001cf0d8`) yang secara default bernilai `20`, jika KCP mencoba me-retransmisi satu paket gagal sebanyak 20 kali, ia akan mendeklarasikan koneksi tersebut mati *(broken pipe)*.
+
+Ini berarti *flooding* paket agresif (mengirim paket dengan sangat cepat tanpa batasan interval) tidak serta merta memutuskan koneksi *server*, selama server tersebut sanggup membalas dengan ACK. Namun, jika *spam* paket membuat CPU lokal macet dan gagal memanggil `ikcp_update` untuk memproses ACK yang masuk, nilai *retransmit* akan meledak melebihi 20, dan klien akan "bunuh diri" (*local disconnect*).

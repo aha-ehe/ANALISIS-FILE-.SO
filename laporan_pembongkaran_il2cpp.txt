@@ -1,0 +1,50 @@
+# Laporan Pembongkaran IL2CPP: Analisis Stub Loader (`libil2cpp.so`)
+
+## 1. Analisis Rutin Ekstraksi dan Dekripsi
+File `libil2cpp.so` yang berukuran 384 KB ini telah dipastikan bertindak sebagai sebuah *Loader* (Facade) dan bukan *engine runtime* C# sesungguhnya.
+- **Rutin Ekstraksi:** Pembongkaran fungsi utama `LoadFakeLibIL2CPP` menunjukkan bahwa logika ekstraksi file **tidak** dilakukan di level C/C++. Sebaliknya, *loader* ini secara intensif memanggil *Java Native Interface* (JNI) untuk mendelegasikan tugas ke sisi Java/Kotlin.
+- **Dekripsi:** Tidak ditemukan operasi XOR, dekripsi AES, maupun pemanggilan `lz4_decompress` secara statis di dalam *binary* `libil2cpp.so`. Proses dekripsi, verifikasi *integrity*, dan penulisan *binary* (dari `assets/` atau dari *network*) di-*handle* sepenuhnya oleh *method* Java `CopySOToAppLib`. *Native code* hanya bertugas memicu (`invoke`) metode tersebut dan menunggu hasilnya.
+
+## 2. Tracking Path Output
+Karena proses penulisan file didelegasikan ke *method* Java `CopySOToAppLib` dan `GetPersistentAssetsDataPath`, letak file tujuan bersifat dinamis.
+- Pada `LoadFakeLibIL2CPP` di offset `0x33ac0` (`CallStaticObjectMethod`), *loader* menerima kembalian (return value) berupa objek `java.lang.String` dari fungsi Java.
+- *String* ini kemudian dikonversi menjadi representasi C-string menggunakan `GetStringUTFChars` (JNIEnv offset `0x548` atau `1352` bytes) pada offset `0x33adc`.
+- C-string yang dihasilkan ini akan berisi lokasi path *absolute* ke file `.so` yang asli. Berdasarkan konvensi keamanan *persistent assets* Android, lokasinya hampir dipastikan berada di:
+  `/data/data/<package_name>/files/` atau direktori tersembunyi `app_libs/` atau `app_dx/`.
+
+## 3. Audit `dlopen` dan Nama File
+Instruksi krusial terjadi pada offset `0x33b20` (`bl 58fc0 <dlopen@plt>`).
+- Pointer *string* *path* hasil `GetStringUTFChars` langsung dimasukkan ke register `x0`.
+- Artinya, nama file asli tidak harus bernama `libil2cpp.so`. Java berhak memberikan nama acak (*randomized string* seperti `liba74k8d.so` atau `config.dat`) dan fungsi `dlopen` akan tetap mengeksekusinya selama *magic byte* ELF valid.
+- Ini merupakan teknik *anti-analysis* umum agar analis yang mencari nama "il2cpp" di `/proc/self/maps` terkecoh.
+
+## 4. Strategi Dump Memori (Sang Raja)
+Karena file asli bersembunyi di balik layer Java dan di-*load* dengan potensi nama acak ke *memory*, berikut adalah strategi *memory dump* paling efisien:
+
+### Strategi 1: Frida Hook pada `dlopen`
+Kita dapat menghentikan laju eksekusi tepat saat `dlopen` (atau versi Android spesifik `android_dlopen_ext`) dipanggil oleh stub ini.
+```javascript
+// Frida Script
+Interceptor.attach(Module.findExportByName(null, "dlopen"), {
+    onEnter: function(args) {
+        var path = Memory.readCString(args[0]);
+        if (path && (path.indexOf("/data/data/") !== -1 || path.indexOf("files") !== -1)) {
+            console.log("[+] Target dlopen called with path: " + path);
+            this.target_path = path;
+        }
+    },
+    onLeave: function(retval) {
+        if (this.target_path) {
+            console.log("[+] Library loaded at base address: " + retval);
+            // Initiate memory dump process using the base address and memory maps
+        }
+    }
+});
+```
+*Dengan skrip ini, kita bisa mengetahui path rahasia dan langsung menyalin file .so aslinya dari storage, atau melakukan dump jika file tersebut langsung dihapus (unlink) setelah di-load.*
+
+### Strategi 2: Mapping `/proc/<pid>/maps`
+Jika menggunakan alat seperti *GameGuardian* (untuk rooted device) atau *lldb*:
+1. Biarkan *loader* mengeksekusi `dlopen` sepenuhnya.
+2. Cari pemetaan memori dengan izin `r-xp` yang berukuran besar (antara 20 MB hingga 60 MB), yang khas untuk file IL2CPP.
+3. Ekstrak area memori tersebut mulai dari *header* `\x7FELF` hingga akhir segmen, kemudian lakukan *rebuild ELF headers* jika diperlukan menggunakan alat seperti `SoFixer`.

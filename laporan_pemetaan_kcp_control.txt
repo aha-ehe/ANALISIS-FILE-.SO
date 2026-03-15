@@ -1,0 +1,30 @@
+# Laporan Pemetaan IKCPCB (KCP Control Block) pada `libmoba.so`
+
+## 1. Analisis Alokasi Memori
+Berdasarkan *disassembly* dari fungsi `ikcp_create` (`0x000ce300`), proses alokasi objek KCP (`IKCPCB`) dilakukan sebagai berikut:
+- **Ukuran Alokasi:** Fungsi meminta tepat **1336 bytes** (`0x538`) memori (terlihat pada instruksi `mov w0, #0x538` pada offset `0xce31c`). Ukuran ini cukup besar karena struktur KCP menyimpan array antrean paket (*snd_queue*, *rcv_queue*, *snd_buf*, *rcv_buf*) di dalam memori statis/internalnya.
+- **Mekanisme Alokator:** KCP mendukung custom allocator. Pada instruksi `ldr x8, [x22, #3016]` dan `cbz x8, ce348`, kode pertama-tama memeriksa apakah fungsi alokator kustom global telah disetel. Jika belum (`cbz` bernilai nol), ia akan jatuh (*fallback*) memanggil fungsi `malloc` standar C-library di `0xce348` (`bl 1b8760 <malloc@plt>`). Pointer ke blok memori yang baru dialokasikan ini dikembalikan dan disimpan di register `x19` sebagai *base pointer* objek IKCPCB.
+
+## 2. Pemetaan Offset Variabel Kritis (IKCPCB Struct)
+Setelah alokasi berhasil, kode menginisialisasi parameter default KCP dengan memuat nilai dari konstanta global (seperti `IKCP_MTU_DEF`, `IKCP_WND_SND`, dll) menggunakan instruksi *Load/Store Pair* (`ldp`/`stp`) dan *Store Register* (`str`).
+
+Berikut adalah hasil pemetaan offset memori (*relative to base pointer x19*) dari variabel-variabel kritis yang mengontrol kapasitas transmisi:
+
+| Variabel | Tipe Data | Offset (Hex) | Offset (Dec) | Analisis Instruksi Inisialisasi |
+| :--- | :--- | :--- | :--- | :--- |
+| `conv` | `uint32_t` | `+0x00` | 0 | `str w21, [x19]` (ID sesi/percakapan KCP) |
+| `mtu` | `uint32_t` | `+0x04` | 4 | `stp w10, w9, [x19, #4]` (`w10` berisi nilai MTU default, biasanya 1400) |
+| `mss` | `uint32_t` | `+0x08` | 8 | Disimpan bersamaan dengan `mtu` (`w9` adalah hasil perhitungan `MTU - OVERHEAD`) |
+| `rx_rto` | `int32_t` | `+0x30` | 48 | `stp w8, w9, [x19, #48]` (`w8` di-load dari `IKCP_RTO_DEF`) |
+| `rx_minrto`| `int32_t` | `+0x34` | 52 | Disimpan bersamaan dengan `rx_rto` (`w9` di-load dari `IKCP_RTO_MIN`) |
+| `snd_wnd` | `uint32_t` | `+0x38` | 56 | `stp w8, w9, [x19, #56]` (`w8` di-load dari `IKCP_WND_SND` / Send Window) |
+| `rcv_wnd` | `uint32_t` | `+0x3C` | 60 | Disimpan bersamaan dengan `snd_wnd` (`w9` di-load dari `IKCP_WND_RCV` / Receive Window) |
+| `rmt_wnd` | `uint32_t` | `+0x40` | 64 | `str w9, [x19, #64]` (Remote Window, inisialisasi awal sama dengan rcv_wnd) |
+| `interval` | `uint32_t` | `+0x50` | 80 | `stp wzr, w8, [x19, #76]` (Disimpan di 80, `w8` di-load dari `IKCP_INTERVAL` default misal 100ms) |
+
+## 3. Pentingnya Variabel-Variabel Ini
+Mengetahui titik offset ini memungkinkan analisis memori dinamis lebih lanjut:
+- **`mss` (Maximum Segment Size) di Offset `+8`:** Setiap data payload tingkat aplikasi yang dikirimkan menggunakan `ikcp_send` yang panjangnya melebihi `mss` (biasanya ~1376 bytes), **akan dipecah/difragmentasi** menjadi beberapa paket KCP yang lebih kecil.
+- **`snd_wnd` (Send Window) di Offset `+56`:** Ini menentukan seberapa banyak paket (dalam satuan segment) yang boleh *"in-flight"* (dikirim tapi belum di-ACK oleh server). Jika beban tembakan senjata (peluru/skills) dikirim terlalu cepat sehingga total fragment melampaui `snd_wnd`, KCP akan berhenti memancarkan data *(throttling)*, mengakibatkan latensi atau **desinkronisasi parah** di sisi klien karena data tertahan di *local queue*.
+
+Dengan pemetaan memori absolut ini, modifikasi batas kapasitas (Window Scaling) secara eksperimental pada *runtime* (via *memory editing*) dapat dilakukan tepat pada struktur yang dituju (`base_ptr + 56`).
